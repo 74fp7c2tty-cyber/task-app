@@ -7,7 +7,9 @@ import {
   GoogleAuthProvider,
   signInWithPopup,
   signInWithCustomToken,
-  signInAnonymously
+  signInAnonymously,
+  setPersistence,
+  browserLocalPersistence
 } from 'firebase/auth';
 import { 
   getFirestore, 
@@ -52,7 +54,9 @@ import {
   AlertCircle,
   Settings as SettingsIcon,
   Clock,
-  SendHorizontal
+  SendHorizontal,
+  Plus,
+  Minus
 } from 'lucide-react';
 
 /**
@@ -106,8 +110,10 @@ const App = () => {
   const [notificationPermission, setNotificationPermission] = useState('default');
   const [isNotifSettingOpen, setIsNotifSettingOpen] = useState(false);
   const [saveFeedback, setSaveFeedback] = useState(false);
+  
+  // 多機能通知設定 (複数時間設定対応)
   const [notifConfig, setNotifConfig] = useState({
-    deadlineLeadHours: 24,
+    deadlineLeadTimes: [24], 
     dailySummaryTime: "08:00",
     enableSlotReminders: true
   });
@@ -121,37 +127,57 @@ const App = () => {
   const [dragStartHour, setDragStartHour] = useState(null);
   const [dragEndHour, setDragEndHour] = useState(null);
 
-  // Form States (deadlineTimeを追加)
+  // Form States
   const [formTitle, setFormTitle] = useState('');
   const [formHours, setFormHours] = useState('');
   const [formDeadline, setFormDeadline] = useState('');
   const [formDeadlineTime, setFormDeadlineTime] = useState('23:59');
 
-  // 1. Firebase Auth & Messaging Support Check
+  // 1. Firebase Auth Initializing & Persistence Fix
   useEffect(() => {
     const initApp = async () => {
+      // ログイン状態をブラウザに永続化する設定
+      try {
+        await setPersistence(auth, browserLocalPersistence);
+      } catch (e) { console.error("Persistence error", e); }
+
+      // サービスワーカー登録
       if ('serviceWorker' in navigator) {
         try { await navigator.serviceWorker.register('/firebase-messaging-sw.js'); } catch (e) {}
       }
 
+      // 通知サポートチェック
       try {
         const supported = await isSupported();
         if (supported) setMessaging(getMessaging(app));
       } catch (e) { console.warn("Messaging not supported."); }
 
-      try {
-        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-          try { await signInWithCustomToken(auth, __initial_auth_token); } catch (e) { await signInAnonymously(auth); }
-        } else { await signInAnonymously(auth); }
-      } catch (error) { console.error("Auth init error:", error); }
+      // 認証の初期化
+      const initAuth = async () => {
+        try {
+          if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+            try {
+              await signInWithCustomToken(auth, __initial_auth_token);
+            } catch (tokenErr) {
+              console.warn("Custom token mismatch, falling back to existing session or anonymous.");
+              if (!auth.currentUser) await signInAnonymously(auth);
+            }
+          } else if (!auth.currentUser) {
+            await signInAnonymously(auth);
+          }
+        } catch (error) { 
+          console.error("Auth init error:", error); 
+        }
+      };
+      
+      await initAuth();
+      const unsubscribe = onAuthStateChanged(auth, (u) => {
+        setUser(u);
+        setLoading(false);
+      });
+      return () => unsubscribe();
     };
     initApp();
-
-    const unsubscribe = onAuthStateChanged(auth, (u) => {
-      setUser(u);
-      setLoading(false);
-    });
-    return () => unsubscribe();
   }, []);
 
   // 2. Data Sync
@@ -162,17 +188,24 @@ const App = () => {
       try {
         const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'notifications');
         const docSnap = await getDoc(docRef);
-        if (docSnap.exists()) setNotifConfig(docSnap.data());
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+          if (!data.deadlineLeadTimes) {
+            data.deadlineLeadTimes = data.deadlineLeadHours ? [data.deadlineLeadHours] : [24];
+          }
+          setNotifConfig(data);
+        }
       } catch (e) {}
     };
     loadSettings();
 
     const unsubTasks = onSnapshot(collection(db, 'artifacts', appId, 'users', user.uid, 'tasks'), (snap) => {
       setTasks(snap.docs.map(d => ({ id: d.id, photos: [], ...d.data() })));
-    });
+    }, (err) => console.error("Tasks sync error", err));
+
     const unsubSch = onSnapshot(collection(db, 'artifacts', appId, 'users', user.uid, 'schedules'), (snap) => {
       setSchedules(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-    });
+    }, (err) => console.error("Schedules sync error", err));
 
     return () => { unsubTasks(); unsubSch(); };
   }, [user]);
@@ -194,36 +227,34 @@ const App = () => {
       const timeStr = `${hourStr}:${minStr}`;
       const todayDateStr = currentTime.toISOString().split('T')[0];
 
-      // A. 今日のまとめ通知
       if (timeStr === notifConfig.dailySummaryTime) {
         const todayTasksCount = schedules.filter(s => s.date === todayDateStr && !s.recorded).length;
         if (todayTasksCount > 0) {
-          new Notification("今日の予定", { body: `今日は ${todayTasksCount}件 の作業予定があります。` });
+          new Notification("TaskMaster: 今日の予定", { body: `今日は ${todayTasksCount}件 の作業予定があります。`, tag: 'daily-summary' });
         }
       }
 
-      // B. 締切前通知 (時刻まで考慮)
       tasks.forEach(task => {
         if (task.completed || !task.deadline) return;
-        // 時刻設定がないレガシーデータは23:59とする
         const tTime = task.deadlineTime || "23:59";
         const deadlineDate = new Date(`${task.deadline}T${tTime}`);
         const diffHours = (deadlineDate - currentTime) / (1000 * 60 * 60);
         
-        if (diffHours > 0 && diffHours <= notifConfig.deadlineLeadHours && diffHours > (notifConfig.deadlineLeadHours - 0.02)) {
-          new Notification("締切間近！", {
-            body: `「${task.title}」の締切まであと ${notifConfig.deadlineLeadHours} 時間です。`,
-            tag: `deadline-${task.id}`
-          });
-        }
+        notifConfig.deadlineLeadTimes.forEach(leadHour => {
+          if (diffHours > 0 && diffHours <= leadHour && diffHours > (leadHour - 0.02)) {
+            new Notification("締切リマインド", {
+              body: `「${task.title}」の締切まであと ${leadHour} 時間です。`,
+              tag: `deadline-${task.id}-${leadHour}`
+            });
+          }
+        });
       });
 
-      // C. スロット開始通知
       if (notifConfig.enableSlotReminders && currentTime.getMinutes() === 0) {
         const scheduledNow = schedules.find(s => s.date === todayDateStr && s.startTime === `${hourStr}:00` && !s.recorded);
         if (scheduledNow) {
           const t = tasks.find(x => x.id === scheduledNow.taskId);
-          if (t) new Notification("作業開始の時間です", { body: `「${t.title}」を開始しましょう。` });
+          if (t) new Notification("作業開始の時間です", { body: `「${t.title}」を開始しましょう。`, tag: 'slot-start' });
         }
       }
     };
@@ -235,17 +266,33 @@ const App = () => {
   // UI Actions
   const handleLogin = async () => { 
     setAuthErrorMessage('');
-    try { await signInWithPopup(auth, new GoogleAuthProvider()); } catch (e) { 
-      if (e.code === 'auth/unauthorized-domain') setAuthErrorMessage(`ドメイン未承認: 「${window.location.hostname}」を追加してください。`);
+    try { 
+      const provider = new GoogleAuthProvider();
+      await signInWithPopup(auth, provider); 
+    } catch (e) { 
+      if (e.code === 'auth/unauthorized-domain') {
+        setAuthErrorMessage(`ドメイン未承認: 「${window.location.hostname}」を追加してください。`);
+      } else {
+        console.error("Login failed", e);
+      }
     } 
+  };
+
+  const handleLogout = async () => {
+    if (window.confirm("ログアウトしますか？")) {
+      await signOut(auth);
+      window.location.reload();
+    }
   };
 
   const saveNotifSettings = async (newConfig) => {
     setNotifConfig(newConfig);
     if (user) {
-      await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'notifications'), newConfig);
-      setSaveFeedback(true);
-      setTimeout(() => setSaveFeedback(false), 2000);
+      try {
+        await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'notifications'), newConfig);
+        setSaveFeedback(true);
+        setTimeout(() => setSaveFeedback(false), 2000);
+      } catch (e) { console.error("Save settings failed", e); }
     }
   };
 
@@ -263,7 +310,7 @@ const App = () => {
       const permission = await Notification.requestPermission();
       setNotificationPermission(permission);
       if (permission === 'granted') setIsNotifSettingOpen(true);
-    } catch (e) {}
+    } catch (e) { console.error("Permission request error", e); }
   };
 
   const recordWork = async (schId, taskId, actualH, progressDelta) => {
@@ -320,14 +367,19 @@ const App = () => {
     if (!user || !formTitle.trim() || !formHours) return;
     try {
       await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'tasks'), {
-        title: formTitle.trim(), estimatedHours: parseFloat(formHours), 
+        title: formTitle.trim(), 
+        estimatedHours: parseFloat(formHours), 
         deadline: formDeadline || new Date().toISOString().split('T')[0],
         deadlineTime: formDeadlineTime || "23:59",
-        progress: 0, timeSpent: 0, photos: [], completed: false, createdAt: new Date().toISOString()
+        progress: 0, 
+        timeSpent: 0, 
+        photos: [], 
+        completed: false, 
+        createdAt: new Date().toISOString()
       });
       setFormTitle(''); setFormHours(''); setFormDeadline(''); setFormDeadlineTime('23:59');
       setIsAddingTask(false); setActiveTab('list');
-    } catch (err) { console.error(err); }
+    } catch (err) { console.error("Add task failed", err); }
   };
 
   const addSchedule = async (taskId, date, hour) => {
@@ -335,27 +387,16 @@ const App = () => {
     try {
       if (schedules.some(s => s.date === date && parseInt(s.startTime) === hour)) return;
       await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'schedules'), { taskId, date, startTime: `${String(hour).padStart(2, '0')}:00`, recorded: false });
-    } catch (err) { console.error(err); }
+    } catch (err) { console.error("Add schedule failed", err); }
   };
 
   const deleteAllCompleted = async () => {
-    if (!user || !window.confirm("実績をすべて削除しますか？")) return;
-    for (const t of tasks.filter(t => t.completed)) await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'tasks', t.id));
+    if (!user) return;
+    if (!window.confirm("実績をすべて削除しますか？")) return;
+    for (const t of tasks.filter(t => t.completed)) {
+      await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'tasks', t.id));
+    }
   };
-
-  // Drag logic
-  useEffect(() => {
-    const handleGlobalMouseUp = () => {
-      if (dragStartHour !== null) {
-        const start = Math.min(dragStartHour, dragEndHour);
-        const end = Math.max(dragStartHour, dragEndHour);
-        for (let h = start; h <= end; h++) addSchedule(planningSelection, currentDate, h);
-        setDragStartHour(null); setDragEndHour(null);
-      }
-    };
-    window.addEventListener('mouseup', handleGlobalMouseUp);
-    return () => window.removeEventListener('mouseup', handleGlobalMouseUp);
-  }, [dragStartHour, dragEndHour, planningSelection, currentDate]);
 
   if (loading) return <div className="min-h-screen bg-indigo-900 flex items-center justify-center text-white font-bold animate-pulse text-xs tracking-widest">CONNECTING...</div>;
 
@@ -364,9 +405,18 @@ const App = () => {
       <TargetIcon size={64} className="mb-6 opacity-50" />
       <h1 className="text-4xl font-black mb-2 tracking-tighter">TaskMaster</h1>
       <p className="mb-10 opacity-70 italic">Plan your potential.</p>
+      
       {authErrorMessage && <div className="mb-6 bg-red-500/20 border border-red-500/50 p-4 rounded-2xl text-xs text-red-100 flex flex-col items-center gap-2 max-w-sm"><AlertCircle size={20} className="text-red-300" /><p>{authErrorMessage}</p></div>}
-      <button onClick={handleLogin} className="bg-white text-indigo-900 px-10 py-5 rounded-[24px] font-black shadow-2xl flex items-center gap-3 active:scale-95 transition-all"><LogIn size={24} /> Googleでログイン</button>
-      {user?.isAnonymous && <button onClick={() => setUser({...user, isAnonymous: false})} className="mt-8 text-indigo-200 text-xs underline opacity-50">ログインせずに続ける（保存されません）</button>}
+
+      <button onClick={handleLogin} className="bg-white text-indigo-900 px-10 py-5 rounded-[24px] font-black shadow-2xl flex items-center gap-3 active:scale-95 transition-all">
+        <LogIn size={24} /> Googleでログイン
+      </button>
+      
+      {user?.isAnonymous && (
+        <button onClick={() => setUser({...user, isAnonymous: false})} className="mt-8 text-indigo-200 text-xs underline opacity-50">
+          ログインせずに続ける（保存されません）
+        </button>
+      )}
     </div>
   );
 
@@ -376,7 +426,7 @@ const App = () => {
         <div className="flex items-center gap-2 font-black"><TargetIcon size={24}/><span className="text-xl">TaskMaster Pro</span></div>
         <div className="flex items-center gap-3">
           <button onClick={() => notificationPermission === 'granted' ? setIsNotifSettingOpen(true) : requestPermission()} className={`${notificationPermission === 'granted' ? 'bg-green-500/20 text-green-300' : 'bg-white/10 text-white'} p-2 rounded-full transition-all active:scale-90`}>{notificationPermission === 'granted' ? <Bell size={20} /> : <BellOff size={20} />}</button>
-          <button onClick={() => signOut(auth)} className="bg-white/10 p-2 rounded-full hover:bg-white/20 transition-colors"><LogOut size={20}/></button>
+          <button onClick={handleLogout} className="bg-white/10 p-2 rounded-full hover:bg-white/20 transition-colors"><LogOut size={20}/></button>
         </div>
       </header>
 
@@ -449,7 +499,7 @@ const App = () => {
               <div key={task.id} className="bg-white p-5 rounded-[32px] border border-gray-100 flex items-center gap-4 shadow-sm">
                 <div className="flex-1 min-w-0 cursor-pointer" onClick={() => { setTempProgress(task.progress || 0); setTempTime(task.timeSpent || 0); setSelectedTask(task); }}>
                   <h3 className="font-bold text-lg truncate mb-1">{task.title}</h3>
-                  <div className="text-[10px] text-indigo-500 font-black mb-2">締切: {task.deadline?.replace(/-/g, '/')} {task.deadlineTime || "23:59"}</div>
+                  <div className="text-[10px] text-indigo-500 font-black mb-2 flex items-center gap-1"><Clock size={10} /> 締切: {task.deadline?.replace(/-/g, '/')} {task.deadlineTime || "23:59"}</div>
                   <ProgressBar value={task.progress || 0} color="bg-indigo-500" />
                 </div>
                 <div className="flex gap-2">
@@ -537,11 +587,14 @@ const App = () => {
                 </div>
               ))
             )}
+            {tasks.filter(t => t.completed).length > 0 && (
+              <button onClick={deleteAllCompleted} className="w-full py-4 text-red-500 font-bold text-sm bg-white rounded-2xl border border-red-100 active:bg-red-50 transition-colors">実績をすべて削除</button>
+            )}
           </div>
         )}
       </main>
 
-      {/* 丸型の＋ボタンを含むナビゲーション */}
+      {/* 丸型の＋ボタン */}
       <nav className="fixed bottom-6 left-4 right-4 max-w-md mx-auto bg-white/90 backdrop-blur-xl border border-white/20 rounded-[32px] shadow-[0_20px_50px_rgba(0,0,0,0.1)] flex justify-around items-center px-2 py-3 z-20">
         {[
           { id: 'dashboard', icon: LayoutDashboard, label: 'ホーム' },
@@ -562,10 +615,53 @@ const App = () => {
         <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[100] flex items-center justify-center p-6">
           <div className="bg-white w-full max-w-sm rounded-[40px] p-8 space-y-6 animate-in zoom-in duration-300 shadow-2xl">
             <div className="flex justify-between items-center"><h2 className="text-xl font-black flex items-center gap-2"><SettingsIcon size={20}/>通知設定</h2><button onClick={() => setIsNotifSettingOpen(false)} className="p-2 bg-gray-50 rounded-full"><X size={18}/></button></div>
+            
             <div className="space-y-5">
-              <div className="space-y-2"><label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">期限前リマインド</label><div className="flex items-center gap-3 bg-gray-50 p-4 rounded-2xl"><Clock size={18} className="text-indigo-500" /><select className="flex-1 bg-transparent font-bold outline-none" value={notifConfig.deadlineLeadHours} onChange={(e) => saveNotifSettings({...notifConfig, deadlineLeadHours: parseInt(e.target.value)})}><option value={1}>1時間前</option><option value={6}>6時間前</option><option value={12}>12時間前</option><option value={24}>24時間前</option><option value={48}>2日前</option></select></div></div>
-              <div className="space-y-2"><label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">今日のまとめ通知</label><div className="flex items-center gap-3 bg-gray-50 p-4 rounded-2xl"><Calendar size={18} className="text-indigo-500" /><input type="time" className="flex-1 bg-transparent font-bold outline-none" value={notifConfig.dailySummaryTime} onChange={(e) => saveNotifSettings({...notifConfig, dailySummaryTime: e.target.value})}/></div></div>
-              <div className="flex items-center justify-between bg-indigo-50 p-4 rounded-2xl"><span className="text-sm font-bold text-indigo-900">スロット開始時に通知</span><button onClick={() => saveNotifSettings({...notifConfig, enableSlotReminders: !notifConfig.enableSlotReminders})} className={`w-12 h-6 rounded-full transition-all relative ${notifConfig.enableSlotReminders ? 'bg-indigo-600' : 'bg-gray-300'}`}><div className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-all ${notifConfig.enableSlotReminders ? 'left-7' : 'left-1'}`}></div></button></div>
+              <div className="space-y-3">
+                <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">期限前リマインド（複数設定可）</label>
+                <div className="flex flex-wrap gap-2">
+                  {notifConfig.deadlineLeadTimes.map((time, idx) => (
+                    <div key={idx} className="bg-indigo-50 text-indigo-700 px-3 py-2 rounded-xl flex items-center gap-2 text-sm font-black animate-in fade-in">
+                      {time}時間前
+                      <button onClick={() => {
+                        const newTimes = notifConfig.deadlineLeadTimes.filter((_, i) => i !== idx);
+                        saveNotifSettings({...notifConfig, deadlineLeadTimes: newTimes});
+                      }} className="text-indigo-300 hover:text-indigo-600"><Minus size={14} /></button>
+                    </div>
+                  ))}
+                  <button 
+                    onClick={() => {
+                      const hourStr = prompt("何時間前に通知しますか？ (半角数値)");
+                      const hour = parseInt(hourStr || "");
+                      if (!isNaN(hour)) {
+                        const newTimes = Array.from(new Set([...notifConfig.deadlineLeadTimes, hour])).sort((a,b)=>a-b);
+                        saveNotifSettings({...notifConfig, deadlineLeadTimes: newTimes});
+                      }
+                    }}
+                    className="bg-gray-100 text-gray-500 p-2 rounded-xl hover:bg-gray-200"
+                  >
+                    <Plus size={18} />
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">今日のまとめ通知時刻</label>
+                <div className="flex items-center gap-3 bg-gray-50 p-4 rounded-2xl">
+                  <Calendar size={18} className="text-indigo-500" />
+                  <input type="time" className="flex-1 bg-transparent font-bold outline-none" value={notifConfig.dailySummaryTime} onChange={(e) => saveNotifSettings({...notifConfig, dailySummaryTime: e.target.value})}/>
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between bg-indigo-50 p-4 rounded-2xl">
+                <span className="text-sm font-bold text-indigo-900">スロット開始時に通知</span>
+                <button 
+                  onClick={() => saveNotifSettings({...notifConfig, enableSlotReminders: !notifConfig.enableSlotReminders})}
+                  className={`w-12 h-6 rounded-full transition-all relative ${notifConfig.enableSlotReminders ? 'bg-indigo-600' : 'bg-gray-300'}`}
+                >
+                  <div className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-all ${notifConfig.enableSlotReminders ? 'left-7' : 'left-1'}`}></div>
+                </button>
+              </div>
               <button onClick={sendTestNotification} className="w-full flex items-center justify-center gap-2 py-3 border-2 border-indigo-100 rounded-2xl text-indigo-600 font-bold text-sm hover:bg-indigo-50 transition-colors"><SendHorizontal size={18} /> テスト通知を送る</button>
             </div>
             <div className="space-y-3"><button onClick={() => setIsNotifSettingOpen(false)} className="w-full bg-indigo-600 text-white p-4 rounded-3xl font-black shadow-lg">閉じる</button>{saveFeedback && <p className="text-center text-[10px] text-green-500 font-bold animate-pulse">設定を同期しました ✓</p>}</div>
@@ -585,19 +681,12 @@ const App = () => {
                 <input type="date" className="w-full p-4 bg-gray-50 rounded-2xl outline-none font-bold text-sm ring-2 ring-transparent focus:ring-indigo-500/20 transition-all" value={formDeadline} onChange={e=>setFormDeadline(e.target.value)} />
               </div>
               
-              {/* 締め切り時刻設定エリア */}
               <div className="flex items-center gap-3">
                 <div className="flex-1 bg-gray-50 rounded-2xl p-4 flex items-center gap-2 border-2 border-transparent focus-within:border-indigo-500/20 transition-all">
                   <Clock size={18} className="text-gray-400" />
                   <input type="time" className="bg-transparent font-bold outline-none flex-1" value={formDeadlineTime} onChange={e=>setFormDeadlineTime(e.target.value)} />
                 </div>
-                <button 
-                  type="button" 
-                  onClick={() => setFormDeadlineTime("23:59")}
-                  className="bg-indigo-50 text-indigo-600 px-4 py-4 rounded-2xl font-black text-xs active:scale-95 transition-all"
-                >
-                  23:59
-                </button>
+                <button type="button" onClick={() => setFormDeadlineTime("23:59")} className="bg-indigo-50 text-indigo-600 px-4 py-4 rounded-2xl font-black text-xs active:scale-95 transition-all">23:59</button>
               </div>
 
               <button type="submit" className="w-full bg-indigo-600 text-white p-5 rounded-[24px] font-black shadow-lg hover:bg-indigo-700 transition-all">登録する</button>
