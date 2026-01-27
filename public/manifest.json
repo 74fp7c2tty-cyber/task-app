@@ -1,0 +1,8 @@
+{
+  "short_name": "TaskMaster",
+  "name": "TaskMaster Pro",
+  "display": "standalone",
+  "start_url": ".",
+  "theme_color": "#4f46e5",
+  "background_color": "#ffffff"
+}
