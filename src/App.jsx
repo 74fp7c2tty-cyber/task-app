@@ -73,11 +73,10 @@ const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 
-// IDのスラッシュを置換してFirestoreのエラーを防止
 const rawAppId = typeof __app_id !== 'undefined' ? __app_id : 'task-master-v1';
 const appId = rawAppId.replace(/\//g, '_');
 
-// --- UI共通コンポーネント ---
+// --- UI Components ---
 const ProgressBar = ({ value, color = "bg-indigo-600", height = "h-2" }) => {
   const safeValue = isNaN(value) ? 0 : Math.max(0, Math.min(value, 100));
   return (
@@ -102,7 +101,7 @@ const App = () => {
   const [currentDate, setCurrentDate] = useState(new Date().toISOString().split('T')[0]);
   const [now, setNow] = useState(new Date());
   
-  // 通知関連のステート
+  // Messaging Instance
   const [messaging, setMessaging] = useState(null);
   const [notificationPermission, setNotificationPermission] = useState('default');
   const [isNotifSettingOpen, setIsNotifSettingOpen] = useState(false);
@@ -122,35 +121,28 @@ const App = () => {
   const [dragStartHour, setDragStartHour] = useState(null);
   const [dragEndHour, setDragEndHour] = useState(null);
 
+  // Form States (deadlineTimeを追加)
   const [formTitle, setFormTitle] = useState('');
   const [formHours, setFormHours] = useState('');
   const [formDeadline, setFormDeadline] = useState('');
+  const [formDeadlineTime, setFormDeadlineTime] = useState('23:59');
 
-  // 1. アプリ初期化・認証・サービスワーカー登録
+  // 1. Firebase Auth & Messaging Support Check
   useEffect(() => {
     const initApp = async () => {
-      // サービスワーカー登録（背景通知用）
       if ('serviceWorker' in navigator) {
-        try {
-          await navigator.serviceWorker.register('/firebase-messaging-sw.js');
-        } catch (e) { console.warn("Service Worker registration skipped."); }
+        try { await navigator.serviceWorker.register('/firebase-messaging-sw.js'); } catch (e) {}
       }
 
-      // 通知サポートチェック（モバイル・Safari対策）
       try {
         const supported = await isSupported();
-        if (supported && typeof window !== 'undefined') {
-          setMessaging(getMessaging(app));
-        }
+        if (supported) setMessaging(getMessaging(app));
       } catch (e) { console.warn("Messaging not supported."); }
 
-      // 認証処理
       try {
         if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
           try { await signInWithCustomToken(auth, __initial_auth_token); } catch (e) { await signInAnonymously(auth); }
-        } else {
-          await signInAnonymously(auth);
-        }
+        } else { await signInAnonymously(auth); }
       } catch (error) { console.error("Auth init error:", error); }
     };
     initApp();
@@ -162,21 +154,19 @@ const App = () => {
     return () => unsubscribe();
   }, []);
 
-  // 2. データのリアルタイム同期
+  // 2. Data Sync
   useEffect(() => {
     if (!user) return;
     
-    // 設定の読み込み
     const loadSettings = async () => {
       try {
         const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'notifications');
         const docSnap = await getDoc(docRef);
         if (docSnap.exists()) setNotifConfig(docSnap.data());
-      } catch (e) { console.error("Load settings error", e); }
+      } catch (e) {}
     };
     loadSettings();
 
-    // タスクとスケジュールの同期
     const unsubTasks = onSnapshot(collection(db, 'artifacts', appId, 'users', user.uid, 'tasks'), (snap) => {
       setTasks(snap.docs.map(d => ({ id: d.id, photos: [], ...d.data() })));
     });
@@ -187,9 +177,11 @@ const App = () => {
     return () => { unsubTasks(); unsubSch(); };
   }, [user]);
 
-  // 3. 多機能通知エンジン（毎分チェック）
+  // 3. Notification Engine
   useEffect(() => {
-    if ('Notification' in window) setNotificationPermission(Notification.permission);
+    if ('Notification' in window) {
+      setNotificationPermission(Notification.permission);
+    }
 
     const checkNotifications = () => {
       const currentTime = new Date();
@@ -206,17 +198,23 @@ const App = () => {
       if (timeStr === notifConfig.dailySummaryTime) {
         const todayTasksCount = schedules.filter(s => s.date === todayDateStr && !s.recorded).length;
         if (todayTasksCount > 0) {
-          new Notification("今日の予定", { body: `今日は ${todayTasksCount}件 の作業スロットがあります。` });
+          new Notification("今日の予定", { body: `今日は ${todayTasksCount}件 の作業予定があります。` });
         }
       }
 
-      // B. 締切前リマインド
+      // B. 締切前通知 (時刻まで考慮)
       tasks.forEach(task => {
         if (task.completed || !task.deadline) return;
-        const deadlineDate = new Date(`${task.deadline}T23:59:59`);
+        // 時刻設定がないレガシーデータは23:59とする
+        const tTime = task.deadlineTime || "23:59";
+        const deadlineDate = new Date(`${task.deadline}T${tTime}`);
         const diffHours = (deadlineDate - currentTime) / (1000 * 60 * 60);
+        
         if (diffHours > 0 && diffHours <= notifConfig.deadlineLeadHours && diffHours > (notifConfig.deadlineLeadHours - 0.02)) {
-          new Notification("締切間近！", { body: `「${task.title}」の締切まであと ${notifConfig.deadlineLeadHours} 時間です。` });
+          new Notification("締切間近！", {
+            body: `「${task.title}」の締切まであと ${notifConfig.deadlineLeadHours} 時間です。`,
+            tag: `deadline-${task.id}`
+          });
         }
       });
 
@@ -225,7 +223,7 @@ const App = () => {
         const scheduledNow = schedules.find(s => s.date === todayDateStr && s.startTime === `${hourStr}:00` && !s.recorded);
         if (scheduledNow) {
           const t = tasks.find(x => x.id === scheduledNow.taskId);
-          if (t) new Notification("作業開始", { body: `「${t.title}」を始める予定の時間です。` });
+          if (t) new Notification("作業開始の時間です", { body: `「${t.title}」を開始しましょう。` });
         }
       }
     };
@@ -234,11 +232,11 @@ const App = () => {
     return () => clearInterval(timer);
   }, [schedules, tasks, notifConfig]);
 
-  // UI アクション
+  // UI Actions
   const handleLogin = async () => { 
     setAuthErrorMessage('');
     try { await signInWithPopup(auth, new GoogleAuthProvider()); } catch (e) { 
-      if (e.code === 'auth/unauthorized-domain') setAuthErrorMessage(`ドメイン未承認: 「${window.location.hostname}」をFirebaseに追加してください。`);
+      if (e.code === 'auth/unauthorized-domain') setAuthErrorMessage(`ドメイン未承認: 「${window.location.hostname}」を追加してください。`);
     } 
   };
 
@@ -265,7 +263,26 @@ const App = () => {
       const permission = await Notification.requestPermission();
       setNotificationPermission(permission);
       if (permission === 'granted') setIsNotifSettingOpen(true);
-    } catch (e) { console.error(e); }
+    } catch (e) {}
+  };
+
+  const recordWork = async (schId, taskId, actualH, progressDelta) => {
+    if (!user) return;
+    const task = tasks.find(t => t.id === taskId);
+    if (!task) return;
+    const currentRem = metrics.taskMetrics[taskId]?.remainingHours || 0;
+    const currentSlots = schedules.filter(s => s.taskId === taskId && !s.recorded).length;
+    const wasSafe = currentSlots >= (currentRem - 0.1);
+    const newTime = (parseFloat(task.timeSpent) || 0) + actualH;
+    const newProg = Math.min((task.progress || 0) + progressDelta, 100);
+    const isComp = newProg >= 100;
+    await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'tasks', taskId), { timeSpent: newTime, progress: newProg, completed: isComp });
+    if (schId) await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'schedules', schId), { recorded: true });
+    
+    const newAbility = newProg > 0 && newTime > 0 ? (((task.estimatedHours || 0) * (newProg / 100)) / newTime) : metrics.globalAbility;
+    const newRem = ((task.estimatedHours || 0) * (1 - newProg / 100)) / (newAbility || 0.1);
+    const newSlots = currentSlots - (schId ? 1 : 0);
+    if (!isComp && wasSafe && newSlots < (newRem - 0.1)) { setRevisionAlert({ taskId, message: `効率低下により「${task.title}」の計画が不足しました。あと ${Math.ceil(newRem - newSlots)}枠 追加してください。` }); }
   };
 
   const metrics = useMemo(() => {
@@ -303,10 +320,13 @@ const App = () => {
     if (!user || !formTitle.trim() || !formHours) return;
     try {
       await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'tasks'), {
-        title: formTitle.trim(), estimatedHours: parseFloat(formHours), deadline: formDeadline || new Date().toISOString().split('T')[0],
+        title: formTitle.trim(), estimatedHours: parseFloat(formHours), 
+        deadline: formDeadline || new Date().toISOString().split('T')[0],
+        deadlineTime: formDeadlineTime || "23:59",
         progress: 0, timeSpent: 0, photos: [], completed: false, createdAt: new Date().toISOString()
       });
-      setFormTitle(''); setFormHours(''); setFormDeadline(''); setIsAddingTask(false); setActiveTab('list');
+      setFormTitle(''); setFormHours(''); setFormDeadline(''); setFormDeadlineTime('23:59');
+      setIsAddingTask(false); setActiveTab('list');
     } catch (err) { console.error(err); }
   };
 
@@ -318,26 +338,12 @@ const App = () => {
     } catch (err) { console.error(err); }
   };
 
-  const recordWork = async (schId, taskId, actualH, progressDelta) => {
-    if (!user) return;
-    const task = tasks.find(t => t.id === taskId);
-    if (!task) return;
-    const currentRem = metrics.taskMetrics[taskId]?.remainingHours || 0;
-    const currentSlots = schedules.filter(s => s.taskId === taskId && !s.recorded).length;
-    const wasSafe = currentSlots >= (currentRem - 0.1);
-    const newTime = (parseFloat(task.timeSpent) || 0) + actualH;
-    const newProg = Math.min((task.progress || 0) + progressDelta, 100);
-    const isComp = newProg >= 100;
-    await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'tasks', taskId), { timeSpent: newTime, progress: newProg, completed: isComp });
-    if (schId) await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'schedules', schId), { recorded: true });
-    
-    const newAbility = newProg > 0 && newTime > 0 ? (((task.estimatedHours || 0) * (newProg / 100)) / newTime) : metrics.globalAbility;
-    const newRem = ((task.estimatedHours || 0) * (1 - newProg / 100)) / (newAbility || 0.1);
-    const newSlots = currentSlots - (schId ? 1 : 0);
-    if (!isComp && wasSafe && newSlots < (newRem - 0.1)) { setRevisionAlert({ taskId, message: `効率低下により「${task.title}」の計画が不足しました。あと ${Math.ceil(newRem - newSlots)}枠 追加してください。` }); }
+  const deleteAllCompleted = async () => {
+    if (!user || !window.confirm("実績をすべて削除しますか？")) return;
+    for (const t of tasks.filter(t => t.completed)) await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'tasks', t.id));
   };
 
-  // 4. ドラッグ入力ロジック
+  // Drag logic
   useEffect(() => {
     const handleGlobalMouseUp = () => {
       if (dragStartHour !== null) {
@@ -443,7 +449,7 @@ const App = () => {
               <div key={task.id} className="bg-white p-5 rounded-[32px] border border-gray-100 flex items-center gap-4 shadow-sm">
                 <div className="flex-1 min-w-0 cursor-pointer" onClick={() => { setTempProgress(task.progress || 0); setTempTime(task.timeSpent || 0); setSelectedTask(task); }}>
                   <h3 className="font-bold text-lg truncate mb-1">{task.title}</h3>
-                  <div className="text-[10px] text-indigo-500 font-black mb-2">締切: {task.deadline?.replace(/-/g, '/')}</div>
+                  <div className="text-[10px] text-indigo-500 font-black mb-2">締切: {task.deadline?.replace(/-/g, '/')} {task.deadlineTime || "23:59"}</div>
                   <ProgressBar value={task.progress || 0} color="bg-indigo-500" />
                 </div>
                 <div className="flex gap-2">
@@ -551,7 +557,7 @@ const App = () => {
         ))}
       </nav>
 
-      {/* 各種モーダル */}
+      {/* 通知設定モーダル */}
       {isNotifSettingOpen && (
         <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[100] flex items-center justify-center p-6">
           <div className="bg-white w-full max-w-sm rounded-[40px] p-8 space-y-6 animate-in zoom-in duration-300 shadow-2xl">
@@ -567,6 +573,7 @@ const App = () => {
         </div>
       )}
 
+      {/* 課題追加モーダル */}
       {isAddingTask && (
         <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-end p-0">
           <div className="bg-white w-full rounded-t-[48px] p-10 space-y-6 animate-in slide-in-from-bottom duration-300">
@@ -577,6 +584,22 @@ const App = () => {
                 <input type="number" step="0.1" placeholder="予定時間(h)" className="w-full p-4 bg-gray-50 rounded-2xl outline-none font-bold ring-2 ring-transparent focus:ring-indigo-500/20 transition-all" value={formHours} onChange={e=>setFormHours(e.target.value)} />
                 <input type="date" className="w-full p-4 bg-gray-50 rounded-2xl outline-none font-bold text-sm ring-2 ring-transparent focus:ring-indigo-500/20 transition-all" value={formDeadline} onChange={e=>setFormDeadline(e.target.value)} />
               </div>
+              
+              {/* 締め切り時刻設定エリア */}
+              <div className="flex items-center gap-3">
+                <div className="flex-1 bg-gray-50 rounded-2xl p-4 flex items-center gap-2 border-2 border-transparent focus-within:border-indigo-500/20 transition-all">
+                  <Clock size={18} className="text-gray-400" />
+                  <input type="time" className="bg-transparent font-bold outline-none flex-1" value={formDeadlineTime} onChange={e=>setFormDeadlineTime(e.target.value)} />
+                </div>
+                <button 
+                  type="button" 
+                  onClick={() => setFormDeadlineTime("23:59")}
+                  className="bg-indigo-50 text-indigo-600 px-4 py-4 rounded-2xl font-black text-xs active:scale-95 transition-all"
+                >
+                  23:59
+                </button>
+              </div>
+
               <button type="submit" className="w-full bg-indigo-600 text-white p-5 rounded-[24px] font-black shadow-lg hover:bg-indigo-700 transition-all">登録する</button>
               <button type="button" onClick={()=>setIsAddingTask(false)} className="w-full text-gray-400 py-2 font-bold text-sm hover:text-gray-600">キャンセル</button>
             </form>
